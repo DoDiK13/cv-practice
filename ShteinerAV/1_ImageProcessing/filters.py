@@ -2,8 +2,6 @@ import numpy as np
 from abc import ABC, abstractmethod
 import cv2
 
-import numpy as np
-
 class ImageFilter(ABC):
     @abstractmethod
     def apply_filter(self, image: np.ndarray) -> np.ndarray:
@@ -152,10 +150,6 @@ class Tape(ImageFilter):
 
         return result
 
-
-import numpy as np
-
-
 class Matte(ImageFilter):
     def __init__(self, scale: float = 0.9, feather: float = 0.15, fill_color: tuple = (255, 255, 255), density: float = 0.0):
         self.scale = max(0.1, min(1.0, float(scale)))
@@ -200,7 +194,7 @@ class Matte(ImageFilter):
 
 
 class Noize(ImageFilter):
-    def __init__(self, noise_amount: float = 0.008, num_scratches: int = 12, scratch_intensity: float = 0.7):
+    def __init__(self, noise_amount: float = 0.004, num_scratches: int = 12, scratch_intensity: float = 0.7):
         self.noise_amount = max(0.0, min(0.1, float(noise_amount)))
         self.num_scratches = max(0, int(num_scratches))
         self.scratch_intensity = max(0.0, min(1.0, float(scratch_intensity)))
@@ -263,162 +257,155 @@ class Noize(ImageFilter):
         h, w = image.shape[:2]
         result = image.astype(np.float32)
 
+        white_mask = np.zeros((h, w), dtype=np.float32)
+        black_mask = np.zeros((h, w), dtype=np.float32)
+
         if self.noise_amount > 0:
             rand_matrix = np.random.rand(h, w)
-
-            dust_white_mask = rand_matrix < (self.noise_amount * 0.6)
-            dust_black_mask = (rand_matrix >= (self.noise_amount * 0.6)) & (rand_matrix < self.noise_amount)
-
-            if len(image.shape) == 3:
-                dust_white_mask = dust_white_mask[..., None]
-                dust_black_mask = dust_black_mask[..., None]
-
-            result[dust_white_mask.repeat(result.shape[-1] if len(image.shape) == 3 else 1,
-                                          axis=-1 if len(image.shape) == 3 else 0)] = 245.0
-            result[dust_black_mask.repeat(result.shape[-1] if len(image.shape) == 3 else 1,
-                                          axis=-1 if len(image.shape) == 3 else 0)] = 15.0
+            white_mask[rand_matrix < (self.noise_amount * 0.6)] = 1.0
+            black_mask[(rand_matrix >= (self.noise_amount * 0.6)) & (rand_matrix < self.noise_amount)] = 1.0
 
         if self.num_scratches > 0 and self.scratch_intensity > 0:
-            scratches_mask = self._generate_scratches_mask(h, w)
-            if scratches_mask.max() > 0:
-                kernel = np.array([
-                    [0, 1, 0],
-                    [1, 2, 1],
-                    [0, 1, 0]
-                ], dtype=np.float32) / 12.0
+            scratches = self._generate_scratches_mask(h, w)
+            # np.maximum нужен, чтобы царапины не пересвечивали пыль, если они пересеклись
+            white_mask = np.maximum(white_mask, scratches)
 
-                padded = np.pad(scratches_mask, ((1, 1), (1, 1)), mode='edge')
+        def blur(mask_to_blur):
+            if mask_to_blur.max() == 0:
+                return mask_to_blur
+            kernel = np.array([
+                [0, 1, 0],
+                [1, 2, 1],
+                [0, 1, 0]
+            ], dtype=np.float32) / 6.0
+            padded = np.pad(mask_to_blur, ((1, 1), (1, 1)), mode='edge')
+            windows = np.lib.stride_tricks.sliding_window_view(padded, (3, 3))
+            return np.sum(windows * kernel, axis=(-2, -1))
 
-                windows = np.lib.stride_tricks.sliding_window_view(padded, (3, 3))
+        white_mask = blur(white_mask)
+        black_mask = blur(black_mask)
 
-                scratches_mask = np.sum(windows * kernel, axis=(-2, -1))
-            scratches_mask = (scratches_mask * self.scratch_intensity * 180.0)[..., None]
-            result[..., :3] = np.clip(result[..., :3] + scratches_mask, 0, 255)
+        w_alpha = np.clip(white_mask * self.scratch_intensity, 0.0, 1.0)[..., None]
+        b_alpha = np.clip(black_mask, 0.0, 1.0)[..., None]
+
+        result[..., :3] = result[..., :3] * (1.0 - w_alpha) + 255.0 * w_alpha
+        result[..., :3] = result[..., :3] * (1.0 - b_alpha) + 0.0 * b_alpha
 
         return np.clip(result, 0, 255).astype(np.uint8)
 
+
 class Neon(ImageFilter):
-    def __init__(self, glow_color: tuple = (0, 255, 230), intensity: float = 1.5,
-                 blur_radius: int = 2, line_thickness: float = 1.0):
-        self.glow_color = np.array(glow_color, dtype=np.float32)
-        self.intensity = float(intensity)
-        self.blur_radius = max(1, int(blur_radius))
-        self.line_thickness = max(0.1, line_thickness)
+    def __init__(self, thickness:float = 2.0, intention: float = 0.3, glow_radius: float = 2, edges: float = 1.0):
+        self.thickness = max(1.0, min(5.0, thickness))
+        self.intention = max(0.0, min(1.0, intention))
+        self.glow_radius = max(0.0, min(8.0, glow_radius))
+        self.edges = max(0.0, min(1.0, edges))
 
-    def _gaussian_blur_1d(self, image: np.ndarray, sigma: float) -> np.ndarray:
-        """Эффективное гауссово размытие через два прохода 1D ядра"""
-        if sigma <= 0:
-            return image
+    def get_gaussian_kernel(self, radius):
+        if radius <= 0:
+            return np.array([1.0], dtype=np.float32)
+        sigma = max(radius / 2.0, 0.5)
+        x = np.arange(-radius, radius + 1, dtype=np.float32)
+        kernel = np.exp(-0.5 * (x / sigma) ** 2)
+        return kernel / np.sum(kernel)
 
-        size = int(2 * round(3 * sigma) + 1)
-        if size % 2 == 0: size += 1
+    def apply_gaussian_blur(self, image, radius):
+        if radius <= 0:
+            return image.copy()
+        kernel = self.get_gaussian_kernel(int(radius))
+        pad = len(kernel) // 2
 
-        ax = np.linspace(-(size // 2), size // 2, size)
-        kernel = np.exp(-0.5 * (ax / sigma) ** 2)
-        kernel /= kernel.sum()
+        padded_x = np.pad(image, ((0, 0), (pad, pad)), mode='edge')
+        temp = np.zeros_like(image, dtype=np.float32)
+        for i, w in enumerate(kernel):
+            temp += w * padded_x[:, i:i + image.shape[1]]
 
-        h, w = image.shape
-        temp = np.zeros_like(image)
+        padded_y = np.pad(temp, ((pad, pad), (0, 0)), mode='edge')
+        out = np.zeros_like(image, dtype=np.float32)
+        for i, w in enumerate(kernel):
+            out += w * padded_y[i:i + image.shape[0], :]
 
-        # Проход по горизонтали
-        padded_h = np.pad(image, ((0, 0), (size // 2, size // 2)), mode='edge')
-        for i in range(h):
-            for j in range(w):
-                temp[i, j] = np.sum(padded_h[i, j:j + size] * kernel)
+        return out
 
-        # Проход по вертикали
-        result = np.zeros_like(image)
-        padded_v = np.pad(temp, ((size // 2, size // 2), (0, 0)), mode='edge')
-        for i in range(h):
-            for j in range(w):
-                result[i, j] = np.sum(padded_v[i:i + size, j] * kernel)
-
-        return result
-
-    def _sobel_edges(self, gray: np.ndarray) -> np.ndarray:
-        h, w = gray.shape
-
-        # 1. Регулируем толщину через предварительное размытие
-        # Чем больше line_thickness, тем больше sigma размытия
-        sigma = (self.line_thickness - 1.0) * 1.5
-        if sigma > 0:
-            gray_smoothed = self._gaussian_blur_1d(gray, sigma=sigma)
-        else:
-            gray_smoothed = gray
-
-        kernel_gx = np.array([
+    def sobel_filter(self, gray):
+        Kx = np.array([
             [-1, 0, 1],
             [-2, 0, 2],
             [-1, 0, 1]
         ], dtype=np.float32)
 
-        kernel_gy = np.array([
+        Ky = np.array([
             [-1, -2, -1],
             [0, 0, 0],
             [1, 2, 1]
         ], dtype=np.float32)
 
-        padded = np.pad(gray_smoothed, ((1, 1), (1, 1)), mode='edge')
+        padded = np.pad(gray, ((1, 1), (1, 1)), mode='edge')
 
-        gx = np.zeros_like(gray, dtype=np.float32)
-        gy = np.zeros_like(gray, dtype=np.float32)
+        windows = np.lib.stride_tricks.sliding_window_view(padded, (3, 3))
+        gx = np.sum(windows * Kx, axis=(-2, -1))
+        gy = np.sum(windows * Ky, axis=(-2, -1))
 
-        for i in range(3):
-            for j in range(3):
-                gx += kernel_gx[i, j] * padded[i:i + h, j:j + w]
-                gy += kernel_gy[i, j] * padded[i:i + h, j:j + w]
+        return np.hypot(gx, gy)
 
-        magnitude = np.hypot(gx, gy)
-        return magnitude
+    def dilate(self, mask, thickness):
+        if thickness <= 1.0:
+            return mask
 
-    def _simple_blur(self, image: np.ndarray, radius: int) -> np.ndarray:
-        kernel = np.array([
-            [0, 1, 0],
-            [1, 1, 1],
-            [0, 1, 0]
-        ], dtype=np.float32)
+        def dilate_step(m):
+            p = np.pad(m, 1, mode='edge')
 
-        kernel_sum = kernel.sum()
+            windows = np.lib.stride_tricks.sliding_window_view(p, (3, 3))
 
-        blurred = image.copy().astype(np.float32)
-        h, w, c = blurred.shape
+            return np.max(windows, axis=(-2, -1))
 
-        for _ in range(radius):
-            padded = np.pad(blurred, ((1, 1), (1, 1), (0, 0)), mode='edge')
-            new_blurred = np.zeros_like(blurred)
+        t = float(thickness)
+        full_steps = int(t) - 1
+        frac = t - int(t)
 
-            for i in range(3):
-                for j in range(3):
-                    weight = kernel[i, j]
-                    if weight != 0:
-                        new_blurred += weight * padded[i:i + h, j:j + w, :]
+        res = mask.copy()
+        for _ in range(full_steps):
+            res = dilate_step(res)
 
-            blurred = new_blurred / kernel_sum
+        if frac > 0:
+            next_step = dilate_step(res)
+            res = res * (1.0 - frac) + next_step * frac
 
-        return blurred.astype(image.dtype)
+        return res
 
-    def apply_filter(self, image: np.ndarray) -> np.ndarray:
-        if len(image.shape) == 2:
-            orig_rgb = np.stack((image,) * 3, axis=-1).astype(np.float32)
-        else:
-            orig_rgb = image[..., :3].astype(np.float32)
+    def apply_filter(self, image):
+        img_float = image.astype(np.float32)
 
-        gray = 0.299 * orig_rgb[..., 0] + 0.587 * orig_rgb[..., 1] + 0.114 * orig_rgb[..., 2]
+        edges_channels = []
+        for c in range(3):
+            smooth_c = self.apply_gaussian_blur(img_float[:, :, c], radius=1)
+            edges_channels.append(self.sobel_filter(smooth_c))
 
-        edges = self._sobel_edges(gray)
+        edges = np.maximum.reduce(edges_channels)
 
-        edges = (edges / (edges.max() + 1e-5)) * self.intensity
-        # Порог можно чуть снизить, если линии стали слишком тонкими после размытия
-        edges = np.where(edges > 0.2, edges, 0.0)
-        edges = np.clip(edges, 0.0, 1.0)[..., None]
+        edge_threshold = 30 + 70*self.edges
 
-        sharp_neon = edges * self.glow_color
-        glow_aura = self._simple_blur(sharp_neon, radius=self.blur_radius * 2)
-        final_neon = sharp_neon + glow_aura * 1.2
-        result = orig_rgb * 0.7 + final_neon
+        edges = np.where(edges < edge_threshold, 0.0, edges)
 
-        result = np.clip(result, 0, 255).astype(np.uint8)
-        if len(image.shape) == 3 and image.shape[2] == 4:
-            result = np.dstack((result, image[:, :, 3]))
+        if edges.max() > 0:
+            edges = np.clip((edges - edge_threshold) * 2.5, 0, 255)
 
-        return result
+        white_line = self.dilate(edges, self.thickness)
+
+        glow_mask = self.apply_gaussian_blur(white_line, radius=self.glow_radius)
+        if glow_mask.max() > 0:
+            glow_mask = np.clip(glow_mask * 2.5, 0, 255)
+
+        dark_bg = img_float * (1.0 - self.intention)
+
+        neon_layer = np.zeros_like(image, dtype=np.float32)
+        neon_layer[:, :, 0] = glow_mask * 0.85
+        neon_layer[:, :, 1] = glow_mask * 0.15
+        neon_layer[:, :, 2] = glow_mask * 1.00
+
+        white_layer = np.repeat(white_line[:, :, np.newaxis], 3, axis=2)
+
+        result = dark_bg + neon_layer
+        result = np.maximum(result, white_layer)
+
+        return np.clip(result, 0, 255).astype(np.uint8)
